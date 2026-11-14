@@ -1,0 +1,4 @@
+# Pinned for byte-identical reproduction of the submission (tested on Python 3.12, Windows, CPU).
+numpy==2.4.4
+pandas==3.0.2
+lightgbm==4.7.0
