@@ -1,0 +1,2 @@
+# Keep model files byte-identical across platforms (no CRLF conversion on Windows checkout).
+possession/model/* -text
