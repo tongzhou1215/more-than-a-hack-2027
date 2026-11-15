@@ -81,8 +81,11 @@ def score_dump(dump, decoder):
         m["prior"])) for i, m in dump.items()}
 
 
-def out_of_fold_gru(extra, epochs, hidden, device, n_folds=None, log=print, dfl_dir=DFL_DIR):
-    """Train the GRU once per fold. Returns (config, exams, probas, priors) like cv.out_of_fold."""
+def out_of_fold_gru(extra, epochs, hidden, device, n_folds=None, log=print, dfl_dir=DFL_DIR,
+                    seeds=1):
+    """Train the GRU once per fold, or `seeds` GRUs whose probabilities are averaged (member
+    seeds seq.member_seeds(SEED + exam index, seeds), so member 0 is the one-GRU exam's model).
+    Returns (config, exams, probas, priors) like cv.out_of_fold."""
     ids = dfl.match_ids(dfl_dir)
     ball_runs = augment.ball_run_lengths(atd.load())
     views, exams, exam_x, n_features = {}, {}, {}, None
@@ -104,16 +107,18 @@ def out_of_fold_gru(extra, epochs, hidden, device, n_folds=None, log=print, dfl_
         assert exam_id not in train_ids, "exam match leaked into its own training set"
         t0 = time.time()
         fold = [view for j in train_ids for view in views[j]]
-        model, mean, std = seq.fit(fold, seed=train.SEED + ids.index(exam_id), device=device,
-                                   epochs=epochs, hidden=hidden, log=log)
+        models, mean, std = seq.fit_many(
+            fold, seq.member_seeds(train.SEED + ids.index(exam_id), seeds), device=device,
+            epochs=epochs, hidden=hidden, log=log)
         counts = sum(np.bincount(y[g], minlength=3)[:3] for _, y, _, g in fold)
-        probas[exam_id] = seq.predict_match(model, seq.scale(exam_x[exam_id], mean, std),
-                                            exams[exam_id]["halves"], device)
+        probas[exam_id] = seq.predict_members(models, seq.scale(exam_x[exam_id], mean, std),
+                                              exams[exam_id]["halves"], device)
         priors[exam_id] = counts / counts.sum()
-        log("{}: GRU trained on {} views, exam predicted, {:.0f} s".format(
-            exam_id, len(fold), time.time() - t0))
+        log("{}: {} GRU(s) trained on {} views, exam predicted, {:.0f} s".format(
+            exam_id, seeds, len(fold), time.time() - t0))
 
-    config = {"model": "gru", "ids": ids, "exams": [e for e, _ in turns], "epochs": epochs,
+    config = {"model": "gru", "ids": ids, "exams": [e for e, _ in turns], "seeds": seeds,
+              "seed_stride": seq.SEED_STRIDE, "epochs": epochs,
               "hidden": hidden, "step": seq.STEP, "window": seq.WINDOW, "layers": seq.LAYERS,
               "dropout": seq.DROPOUT, "batch": seq.BATCH, "lr": seq.LR, "seed": train.SEED,
               "copies": train.COPIES, "extra_features": extra, "n_features": n_features,
@@ -180,6 +185,8 @@ def main(argv=None):
                    help="features.build's extra groups (default: train.EXTRA_FEATURES)")
     p.add_argument("--epochs", type=int, default=seq.EPOCHS)
     p.add_argument("--hidden", type=int, default=seq.HIDDEN)
+    p.add_argument("--seeds", type=int, default=1,
+                   help="GRUs per fold, trained from different seeds, probabilities averaged")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--folds", type=int, help="sit only the first N exams (smoke test)")
     p.add_argument("--blend", nargs=2, metavar=("REF", "NEW"),
@@ -196,7 +203,7 @@ def main(argv=None):
             p.error("--tag is needed to save the exam run")
         extra = int(a.extra) if a.extra.isdigit() else a.extra
         config, exams, probas, priors = out_of_fold_gru(extra, a.epochs, a.hidden, a.device,
-                                                        a.folds)
+                                                        a.folds, seeds=a.seeds)
         save_dump(a.tag, exams, probas, priors)
         mine = load_dump(a.tag)
         scores = score_dump(mine, train.DECODER)

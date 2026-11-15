@@ -229,3 +229,29 @@ def test_prediction_runs_in_the_model_dtype():
     p64 = seq.predict_match(copy.deepcopy(model).double(), x, [(0, 64)], step=2, window=16)
     assert p32.dtype == np.float32 and p64.dtype == np.float64
     assert np.allclose(p32, p64, atol=1e-5) and not np.array_equal(p32, p64)
+
+
+def test_member_seeds_start_from_the_given_seed():
+    assert seq.member_seeds(7, 3) == [7, 1007, 2007]
+
+
+def test_fit_many_trains_one_model_per_seed_on_one_scaler():
+    views = _views(np.random.default_rng(6))
+    models, mean, std = seq.fit_many(views, [6, 1006], epochs=1, hidden=4, window=20, batch=4)
+    single, m1, s1 = seq.fit(views, seed=6, epochs=1, hidden=4, window=20, batch=4)
+    assert len(models) == 2
+    assert np.array_equal(mean, m1) and np.array_equal(std, s1)
+    sa, sb, sc = models[0].state_dict(), single.state_dict(), models[1].state_dict()
+    assert all(torch.equal(sa[k], sb[k]) for k in sa)
+    assert not all(torch.equal(sa[k], sc[k]) for k in sa)
+
+
+def test_predict_members_is_the_mean_of_the_members():
+    a, b = _small_model(seed=1), _small_model(seed=2)
+    x = np.random.default_rng(7).normal(size=(40, 5)).astype(np.float32)
+    halves = [(0, 20), (22, 40)]
+    pa = seq.predict_match(a, x, halves, step=2, window=8)
+    pb = seq.predict_match(b, x, halves, step=2, window=8)
+    both = seq.predict_members([a, b], x, halves, step=2, window=8)
+    assert np.allclose(both, (pa + pb) / 2, rtol=0, atol=1e-7)
+    assert np.array_equal(seq.predict_members([a], x, halves, step=2, window=8), pa)

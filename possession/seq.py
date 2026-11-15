@@ -44,6 +44,7 @@ GRAD_CLIP = 1.0
 CLIP = 10.0        # standardised features are clipped to +/- CLIP
 MIN_STD = 1e-6     # a feature that varies less than this is treated as constant
 MODEL_FILES = ("gru.npy", "gru.json")  # the parameters (flat float32) and everything else
+SEED_STRIDE = 1000  # member s of an ensemble seeded k is seeded k + SEED_STRIDE * s
 
 
 def fit_scaler(xs, masks):
@@ -151,18 +152,31 @@ def train_model(seqs, n_features, seed, device="cpu", epochs=EPOCHS, hidden=HIDD
     return model
 
 
-def fit(views, seed, device="cpu", epochs=EPOCHS, hidden=HIDDEN, window=WINDOW, batch=BATCH,
-        log=None):
-    """The scaler fitted on every graded frame of the views, then a SeqNet trained on their phase
-    sequences. views: [(features (T, F), labels (T,), halves, graded mask (T,))].
-    Returns (model in eval mode, mean, std)."""
+def member_seeds(seed, n):
+    """The seeds of an n-member ensemble seeded `seed`; member 0 keeps `seed` itself."""
+    return [seed + SEED_STRIDE * s for s in range(n)]
+
+
+def fit_many(views, seeds, device="cpu", epochs=EPOCHS, hidden=HIDDEN, window=WINDOW,
+             batch=BATCH, log=None):
+    """The scaler fitted on every graded frame of the views, then one SeqNet per seed trained on
+    their phase sequences. The members see the same data and differ only in their seed.
+    views: [(features (T, F), labels (T,), halves, graded mask (T,))].
+    Returns ([models in eval mode], mean, std)."""
     mean, std = fit_scaler([f for f, _, _, _ in views], [g for _, _, _, g in views])
     seqs = []
     for f, y, halves, _ in views:
         seqs += sequences(scale(f, mean, std), y, halves)
-    model = train_model(seqs, views[0][0].shape[1], seed, device, epochs, hidden, window, batch,
-                        log)
-    return model, mean, std
+    models = [train_model(seqs, views[0][0].shape[1], s, device, epochs, hidden, window, batch,
+                          log) for s in seeds]
+    return models, mean, std
+
+
+def fit(views, seed, device="cpu", epochs=EPOCHS, hidden=HIDDEN, window=WINDOW, batch=BATCH,
+        log=None):
+    """fit_many with one seed: (model in eval mode, mean, std)."""
+    models, mean, std = fit_many(views, [seed], device, epochs, hidden, window, batch, log)
+    return models[0], mean, std
 
 
 def save(folder, model, mean, std, meta=None):
@@ -252,3 +266,12 @@ def predict_match(model, x, halves, device="cpu", step=STEP, window=WINDOW):
     for start, stop in halves:
         out[start:stop] = predict_half(model, x[start:stop], device, step, window)
     return out
+
+
+def predict_members(models, x, halves, device="cpu", step=STEP, window=WINDOW):
+    """The mean of the members' predict_match probabilities, summed in member order."""
+    total = None
+    for model in models:
+        p = predict_match(model, x, halves, device, step, window)
+        total = p if total is None else total + p
+    return total / len(models)
