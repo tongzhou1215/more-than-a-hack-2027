@@ -7,6 +7,8 @@ how much dead ball the trained model predicts with and without the ball in view.
 either is a sign that the augmentation or the feature normalisation does not match the target.
 """
 
+import json
+
 import numpy as np
 import lightgbm as lgb
 
@@ -18,15 +20,17 @@ WATCH = ["v_all", "v_all_m75", "vmax_h", "b_speed", "b_out", "b_out_m25", "b_tou
 
 
 def main():
+    with open(MODEL_DIR + "/decoder.json") as handle:
+        extra = json.load(handle).get("extra_features", 0)  # the features the model was trained on
     target = atd.load()
     runs = augment.ball_run_lengths(target)
-    ft, names, mt = features.build(target)
+    ft, names, mt = features.build(target, extra=extra)
     ft = ft[mt]
 
     parts = []
     for n, i in enumerate(dfl.match_ids()[-N_VAL:]):
         m = augment.corrupt(dfl.load(i), runs, np.random.default_rng(SEED + 100 + n))
-        f, _, mk = features.build(m)
+        f, _, mk = features.build(m, extra=extra)
         parts.append((f[mk], m["labels"][mk]))
     fd = np.vstack([a for a, _ in parts])
     yd = np.concatenate([b for _, b in parts])

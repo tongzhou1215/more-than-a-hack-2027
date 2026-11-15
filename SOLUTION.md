@@ -8,6 +8,114 @@
 
 ---
 
+## 0. 2026-11-14 晚更新：当前版本（v4）
+
+本节是现在的提交版本。后面的 0.1 节（v3）和第 1–8 节是之前的记录；模型、参数和复现步骤以本节为准。
+
+### 现在提交用的是什么
+- **两个模型合用**：每一帧的 H/A/D 概率 = **0.35 × LightGBM + 0.65 × GRU**，权重写在 `possession/model/decoder.json` 的 `lgbm_weight`。
+  - **LightGBM**：配置和 v3 相同（109 个特征，2 份弄脏副本加主客互换，126 轮），用修好方向的特征重新训练。
+  - **GRU**（[`possession/seq.py`](possession/seq.py)）：双向 GRU，读和 LightGBM 一样的 109 个特征，但按时间顺序读：每秒 5 步，一个窗口 60 秒，前后都能看到。训练 6 轮，种子 2027。权重存成 `gru.npy`（所有参数排成一列 float32），其余信息（结构、特征表、特征标准化参数）存在 `gru.json`。
+- **解码**：Viterbi，`team_cost=2, dead_cost=64, min_len=75`，和 v3 相同。
+- **开球规则**：和 v3 相同，在合用之后、解码之前生效。
+- **修了一个进攻方向的 bug**（`features._orient`）：每个半场要先统一方向，让主队防守 −x 一侧。原来的规则是"主队平均站位过了中线就翻转"，可主队整个半场压着对手打时会被判反（德甲 J03WR9 上半场就是这样）。现在改成比较两队的平均站位：主队平均更靠 +x 就翻转。巴萨这场两条规则结论相同（已在两个半场的开球时刻核对），所以巴萨的输入没有变：用 v3 模型重新预测，CSV 逐字节相同。
+
+### 怎么选出来的
+考场和 v3 一样：7 场德甲轮流当考题，答案按 2 秒受控口径，用官方 spellF1 打分。GRU 的考场是 [`possession/seq_cv.py`](possession/seq_cv.py)，考题和 `cv.py` 完全相同（输入指纹一致）；它和最终训练用同一个函数 `seq.fit` 训练。
+
+| 版本 | 7 场考场 spellF1 | 和 v3 比 | 7 场里变好 |
+|---|---|---|---|
+| 官方 baseline_smooth50 | 0.195 | | |
+| v3 | 0.642 | — | — |
+| LightGBM，修好方向 | 0.659 | +0.017 | 4 场 |
+| GRU，修好方向，6 轮 | 0.701 | +0.059 | 7 场 |
+| **v4：0.35 × LightGBM + 0.65 × GRU** | **0.712** | **+0.070** | **7 场** |
+
+- 和"修好方向的 LightGBM"比，合用也是 7 场全部变好（+0.053）。
+- 公开 5 分钟只在最后对最终版本查了一次，不参与任何选择：spellF1 0.690、macroF1 0.908（v3 是 0.676 / 0.903，官方 baseline_smooth50 是 0.326）。这 5 分钟只有 17 段控球，这点差别在噪声范围内。
+- 0.35 和 6 轮是在考场上挑的，算轻微地看了考卷；但 0.20 和 0.50 也有 0.710 和 0.708，结果不依赖恰好选中 0.35。
+
+**试过但没有采用**：
+- 触球线索（某队球员 1–2 米内有球、对方没人靠近）：+0.012，但 7 场只赢 4 场，没过门槛；代码留在 `features.py`，默认不启用。
+- GRU 训练 30 轮：0.624，比训练 6 轮的 0.657 低（这两次都在修方向之前），学过头了。
+- 解码改成 `team_cost=4`：只多 0.001，没过门槛。
+
+### 复现
+环境：`pip install -r possession/requirements.txt`（推荐 Python 3.12）。v4 新增了 PyTorch 2.7.1。只做预测的话 CPU 版就够；训练时有 NVIDIA GPU 会自动用 GPU。
+```bash
+python -m possession.train
+```
+在 RTX 5060 笔记本上约 2.5 分钟，其中 GRU 约 40 秒。LightGBM 和 GRU 用同一批 28 份训练数据（7 场 × 2 份弄脏副本 × 主客互换）。在这台机器上重新训练两次，4 个模型文件（`lgbm.txt`、`decoder.json`、`gru.npy`、`gru.json`）逐字节一致。没有 GPU 时可以用 `--device cpu`，但 GRU 权重会和 GPU 训练出来的略有不同，所以提交以仓库里的模型文件为准。
+```bash
+python -m possession.predict
+```
+约 17 秒。GRU 在 CPU 上用 float64 计算，不需要 GPU。输出 `evaluation/results/lgbm_viterbi.csv`，sha256 以 `e82e6b31bb93d690` 开头，连跑两次完全一致。v3 的模型和 CSV 备份在 `.superpowers/backup/v3_2026-11-14/`（不进 git）。
+
+整场比赛上（不看答案）：死球占 46%，活球里巴萨控球 61%，共 242 段控球、平均 14.1 秒；v3 是 238 段、14.5 秒，和 Smart Tagging 的吻合程度两版基本一样。
+```bash
+python -m possession.seq_cv --tag g3 --epochs 6
+```
+GRU 的考场，在 GPU 上约 5 分钟，平均 0.7012；重跑一次，7 场的概率逐个相同。LightGBM 的考场还是 `python -m possession.cv --exam-controlled 2 --decoder 2,64,75 --extra-features 1 --copies 2`（平均 0.6592）。合用的分数用 `python -m possession.seq_cv --blend v3o g3` 算，但其中 LightGBM 的考场概率文件 `v3o` 目前是用一个临时脚本生成的，还没放进仓库。
+
+测试用 `python -m pytest possession/tests`，81 个，需要另装 pytest；没装 PyTorch 时 GRU 相关的 4 个会跳过。
+
+### 提交前还要做
+- [ ] 提交（commit）并推送 v4 的代码和模型文件。
+- [ ] 检查仓库里没有比赛数据，再把仓库改成公开。
+- [ ] 写技术文档。
+- [ ] 把 CSV 和文档按队名命名（`<team_name>.csv`、`<team_name>.pdf`），在截止前用报名邮件里的表单提交。
+
+---
+
+## 0.1 2026-11-14 更新：v3（已被 v4 取代）
+
+下面是 v3 当时的记录。
+
+### 现在提交用的是什么
+- **模型**：LightGBM，84 个基础特征加 25 个新特征（`features.build(extra=1)`）。新特征主要是"之前 / 之后"：过去 5 秒谁离球近、接下来 5 秒两队往哪个方向推进，另外还有 ±20 秒的长窗口和逼抢速度。
+- **训练**：每场德甲做 2 份弄脏副本，每份配一份主客互换副本；7 场全部用上，固定训练 126 轮。
+- **解码**：Viterbi，`team_cost=2, dead_cost=64, min_len=75`（每段最短 3 秒）。
+- **开球规则**：一个半场开球之前，球不可能在比赛中，所以判 D。开球时刻取自 Smart Tagging 的 "Kick Off (Start)"，代码里不写帧号（`predict.pre_kickoff`）。这条规则只改动了下半场开球前那段：判成 D 的比例从 52% 升到 97%。
+
+### 怎么选出来的
+- 考场是 [`possession/cv.py`](possession/cv.py)：7 场德甲轮流当考题，其余 6 场训练。考题答案按 2 秒"受控控球"口径改写（[`possession/labels.py`](possession/labels.py)：对方控球不满 2 秒不算换控球），用官方 spellF1 打分。考题的输入有指纹，换了考题会报警告。
+- 每个改动必须 7 场里至少赢 5 场、平均至少涨 0.005 才采用。
+- 公开 5 分钟没有参与任何选择，只在最后对最终版本检查了一次。
+
+| 版本 | 7 场考场 spellF1（2 秒口径） | 公开 5 分钟 spellF1 / macroF1 |
+|---|---|---|
+| 官方 baseline_smooth50 | 0.195 | 0.326 / 0.621 |
+| v2（11-13，解码 2/32/50） | 0.598 | 0.638 / 0.882 |
+| **v3（当前）** | **0.642** | **0.676 / 0.903** |
+
+**试过但没有采用**（每项都是和当时最好的版本比，结果在括号里）：
+- 训练 300 轮（+0.002）；
+- 叶子数 127（−0.001）；
+- 学习率 0.025 训练 400 轮（+0.001）；
+- 3 个模型取平均（+0.001）；
+- 3 份弄脏副本（−0.003）；
+- 第二批"之前 / 之后"特征（+0.004，未过门槛）；
+- 球的前进方向特征（−0.007）；
+- 更强的正则化（−0.006）；
+- 训练答案改用 1 秒或 2 秒口径（−0.003 和 −0.009）；
+- 死球单独设最短段长（没有提升）。
+
+### 复现
+```bash
+python -m possession.train
+```
+约 1.5 分钟。重新训练两次，`lgbm.txt` 和 `decoder.json` 逐字节一致。
+```bash
+python -m possession.predict
+```
+约 6 秒，输出 `evaluation/results/lgbm_viterbi.csv`，sha256 以 `7d9ca13e46a9c78f` 开头。
+```bash
+python -m possession.cv --exam-controlled 2 --decoder 2,64,75 --extra-features 1 --copies 2
+```
+考场，约 3 分钟，平均 0.6422。测试用 `python -m pytest possession/tests`，44 个，需要另装 pytest。
+
+---
+
 ## 1. 当前结果
 
 方法：**LightGBM 逐帧打分 + Viterbi 分段**。训练只用其他比赛（DFL 德甲公开数据），比赛本场的任何标签都不参与训练或调参。

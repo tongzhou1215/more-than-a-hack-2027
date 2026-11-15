@@ -1,4 +1,9 @@
-# Pinned for byte-identical reproduction of the submission (tested on Python 3.12, Windows, CPU).
+# Pinned for byte-identical reproduction of the submission (tested on Python 3.12, Windows).
 numpy==2.4.4
 pandas==3.0.2
 lightgbm==4.7.0
+# PyTorch runs the GRU. From PyPI on Windows this is the CPU build, which is all predict needs:
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+# The committed GRU was trained with the CUDA 12.8 build on an RTX 5060 laptop GPU:
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1

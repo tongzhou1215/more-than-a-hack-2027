@@ -4,6 +4,10 @@
     python -m possession.cv --tag v2                 # ... and save it as data/cache/cv/v2.json
     python -m possession.cv --tag v3 --against v2    # ... and compare with v2, match by match
     python -m possession.cv --folds 2 --rounds 20    # quick smoke test
+    python -m possession.cv --exam-controlled 2 --train-controlled 2   # answers read as
+                                                     # controlled possession (possession/labels.py)
+    python -m possession.cv --grid --tag g           # score all 36 decoder settings of GRID
+    python -m possession.cv --decoder 1,64,25        # sit the exam with one given setting
 
 Each DFL match sits the exam once. Its model is trained on the other matches exactly the way
 possession/train.py trains: corrupted and team-swapped copies, the same seeds, the same LightGBM
@@ -28,7 +32,8 @@ import lightgbm as lgb
 import numpy as np
 
 from . import atd, augment, dfl, features, train
-from .common import CACHE_DIR, DFL_DIR, ROOT, X
+from .common import CACHE_DIR, DFL_DIR, FPS, ROOT, X
+from .labels import controlled
 
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "evaluation"))
@@ -98,6 +103,20 @@ def baseline_codes(match, window=BASELINE_WINDOW):
     return out
 
 
+def _frames(seconds):
+    return None if seconds is None else int(round(seconds * FPS))
+
+
+def exam_copy(raw, ball_runs, k, exam_frames=None):
+    """Match k's exam: corrupted with a seed of its own, answers read as controlled possession when
+    exam_frames is set. The inputs never depend on exam_frames -- only the labels do."""
+    exam = augment.corrupt(raw, ball_runs,
+                           np.random.default_rng(train.SEED + EXAM_SEED_OFFSET + k))
+    if exam_frames is not None:
+        exam["labels"] = controlled(exam["labels"], exam_frames)
+    return exam
+
+
 def _scores(gt, pred):
     r = pm.evaluate(gt, pred)
     return {"spell_f1": float(r["spell_f1_mean"]), "macro_f1": float(r["macro_f1"]),
@@ -105,53 +124,183 @@ def _scores(gt, pred):
             "n_gt": int(r["n_gt_spells"])}
 
 
-def run_exam(rounds, decoder, n_folds=None, log=print, dfl_dir=DFL_DIR):
-    """Sit every exam (or the first n_folds). Returns {"config": ..., "matches": {id: scores}}."""
+GRID = {"team_cost": (0.5, 1.0, 2.0, 4.0), "dead_cost": (16.0, 32.0, 64.0), "min_len": (25, 50, 75)}
+
+
+def parse_decoder(text):
+    """'team_cost,dead_cost,min_len[,min_len_dead]' -> a decoder dict, prior_power 0."""
+    values = text.split(",")
+    decoder = {"team_cost": float(values[0]), "dead_cost": float(values[1]),
+               "min_len": int(values[2]), "prior_power": 0.0}
+    if len(values) > 3:
+        decoder["min_len_dead"] = int(values[3])
+    return decoder
+
+
+COPY_SEED_STRIDE = train.COPY_SEED_STRIDE  # corrupted copy c of match k: SEED + k + 1000 * c
+
+
+def parse_assignment(text):
+    """'key=value' -> (key, value), the value read as int, float, bool or else kept as text."""
+    key, value = text.split("=", 1)
+    for cast in (int, float):
+        try:
+            return key, cast(value)
+        except ValueError:
+            pass
+    if value.lower() in ("true", "false"):
+        return key, value.lower() == "true"
+    return key, value
+
+
+training_views = train.training_views  # the exam trains exactly the way train.py does
+
+
+def _frame_table(views, subsample, extra):
+    return train.frame_table(views, subsample, extra)
+
+
+def parse_floats(text):
+    return [float(v) for v in text.split(",")]
+
+
+def parse_ints(text):
+    return [int(v) for v in text.split(",")]
+
+
+def grid_settings(grid=GRID):
+    """Every combination, in order. A 'min_len_dead' entry gives dead ball its own minimum."""
+    out = []
+    for t in grid["team_cost"]:
+        for d in grid["dead_cost"]:
+            for m in grid["min_len"]:
+                for md in grid.get("min_len_dead") or (None,):
+                    s = {"team_cost": t, "dead_cost": d, "min_len": m, "prior_power": 0.0}
+                    if md is not None:
+                        s["min_len_dead"] = md
+                    out.append(s)
+    return out
+
+
+def score_decoder(exams, probas, priors, decoder):
+    """Per-match scores of one decoder setting on out-of-fold probabilities."""
+    return {i: _scores(exams[i]["labels"],
+                       train.decode_match(probas[i], exams[i], decoder, priors[i]))
+            for i in probas}
+
+
+def evaluate_grid(exams, probas, priors, settings, log=None):
+    """[(mean spellF1, setting, per-match scores)], best first; ties keep the grid order."""
+    rows = []
+    for n, setting in enumerate(settings):
+        per = score_decoder(exams, probas, priors, setting)
+        mean = float(np.mean([s["spell_f1"] for s in per.values()]))
+        rows.append((mean, setting, per))
+        if log:
+            log("setting {}/{} {}: mean spellF1 {:.4f}".format(n + 1, len(settings), setting, mean))
+    return sorted(rows, key=lambda r: -r[0])
+
+
+def out_of_fold(rounds, n_folds=None, log=print, dfl_dir=DFL_DIR,
+                exam_controlled_s=None, train_controlled_s=None,
+                lgb_overrides=None, seeds=1, copies=1, extra_features=False):
+    """Train once per fold. Returns (config, exams, probas, priors) for the exams sat.
+
+    exam_controlled_s / train_controlled_s read the exam / training answers as controlled
+    possession with that many seconds as the threshold (possession/labels.py); None = raw DFL.
+    lgb_overrides change LightGBM parameters; seeds > 1 averages that many models per fold (seed
+    SEED + s); copies > 1 adds corrupted training copies; extra_features adds the 25 extra
+    features. The defaults reproduce train.py's model exactly.
+    """
+    params = dict(train.LGB_PARAMS, **(lgb_overrides or {}))
     ids = dfl.match_ids(dfl_dir)
     ball_runs = augment.ball_run_lengths(atd.load())
+    exam_frames, train_frames = _frames(exam_controlled_s), _frames(train_controlled_s)
     tables, exams, names = {}, {}, None
     for k, i in enumerate(ids):
         raw = dfl.load(i, dfl_dir)
-        Xk, yk, names = train.frame_table(train.copies(raw, ball_runs, train.SEED + k),
-                                          train.SUBSAMPLE)
+        teach = raw if train_frames is None else dict(
+            raw, labels=controlled(raw["labels"], train_frames))
+        Xk, yk, names = _frame_table(training_views(teach, ball_runs, k, copies),
+                                     train.SUBSAMPLE, extra_features)
         tables[i] = (Xk, yk)
-        exams[i] = augment.corrupt(raw, ball_runs,
-                                   np.random.default_rng(train.SEED + EXAM_SEED_OFFSET + k))
+        exams[i] = exam_copy(raw, ball_runs, k, exam_frames)
     log("built training tables and exam copies for {} matches".format(len(ids)))
 
     turns = folds(ids)[:n_folds] if n_folds else folds(ids)
-    matches = {}
+    probas, priors = {}, {}
     for exam_id, train_ids in turns:
         assert exam_id not in train_ids, "exam match leaked into its own training set"
         t0 = time.time()
         Xtr = np.vstack([tables[j][0] for j in train_ids])
         ytr = np.concatenate([tables[j][1] for j in train_ids])
-        booster = lgb.train(train.LGB_PARAMS, lgb.Dataset(Xtr, ytr, feature_name=names),
-                            num_boost_round=rounds)
-        prior = np.bincount(ytr, minlength=3) / len(ytr)
-        exam = exams[exam_id]
-        proba = booster.predict(features.build(exam)[0])
-        pred = train.decode_match(proba, exam, decoder, prior)
-        matches[exam_id] = {"model": _scores(exam["labels"], pred),
-                            "baseline": _scores(exam["labels"], baseline_codes(exam))}
-        log("{}: spellF1 {:.4f} (baseline {:.4f}), {:.0f} s".format(
-            exam_id, matches[exam_id]["model"]["spell_f1"],
-            matches[exam_id]["baseline"]["spell_f1"], time.time() - t0))
+        dtrain = lgb.Dataset(Xtr, ytr, feature_name=names, free_raw_data=False)
+        exam_x = features.build(exams[exam_id], extra=extra_features)[0]
+        total = 0.0
+        for s in range(seeds):
+            booster = lgb.train(dict(params, seed=params["seed"] + s), dtrain,
+                                num_boost_round=rounds)
+            total = total + booster.predict(exam_x)
+        priors[exam_id] = np.bincount(ytr, minlength=3) / len(ytr)
+        probas[exam_id] = total / seeds
+        log("{}: {} model(s) trained, exam predicted, {:.0f} s".format(
+            exam_id, seeds, time.time() - t0))
 
-    config = {"ids": ids, "exams": [e for e, _ in turns], "rounds": rounds, "decoder": decoder,
-              "lgb_params": train.LGB_PARAMS, "subsample": train.SUBSAMPLE, "seed": train.SEED,
+    config = {"ids": ids, "exams": [e for e, _ in turns], "rounds": rounds,
+              "lgb_params": params, "subsample": train.SUBSAMPLE, "seed": train.SEED,
               "exam_seed_offset": EXAM_SEED_OFFSET, "baseline_window": BASELINE_WINDOW,
+              "exam_controlled_s": exam_controlled_s, "train_controlled_s": train_controlled_s,
+              "lgb_overrides": dict(lgb_overrides or {}), "seeds": seeds, "copies": copies,
+              "extra_features": extra_features, "n_features": len(names),
               "exam_fingerprints": {i: exam_fingerprint(exams[i]) for i in ids}}
+    return config, exams, probas, priors
+
+
+def run_exam(rounds, decoder, n_folds=None, log=print, dfl_dir=DFL_DIR,
+             exam_controlled_s=None, train_controlled_s=None, **knobs):
+    """Sit every exam (or the first n_folds). Returns {"config": ..., "matches": {id: scores}}.
+    knobs go to out_of_fold (lgb_overrides, seeds, copies, extra_features)."""
+    config, exams, probas, priors = out_of_fold(rounds, n_folds, log, dfl_dir,
+                                                exam_controlled_s, train_controlled_s, **knobs)
+    model = score_decoder(exams, probas, priors, decoder)
+    matches = {i: {"model": model[i],
+                   "baseline": _scores(exams[i]["labels"], baseline_codes(exams[i]))}
+               for i in probas}
+    config["decoder"] = decoder
     return {"config": config, "matches": matches}
+
+
+def _reading(seconds):
+    return "raw DFL" if seconds is None else "controlled, {:g} s".format(seconds)
+
+
+def print_grid(rows, config, current, top=10):
+    """The best settings, and where the committed decoder setting ranks."""
+    print("\ndecoder grid: {} settings on {} exams | LightGBM {} rounds | answers: exam {} | "
+          "training {}".format(len(rows), len(config["exams"]), config["rounds"],
+                               _reading(config.get("exam_controlled_s")),
+                               _reading(config.get("train_controlled_s"))))
+    print("{:>4}  {:>12}  {:>9} {:>9} {:>7} {:>8}   {}".format(
+        "rank", "mean spellF1", "team_cost", "dead_cost", "min_len", "min_dead", "spellF1 per exam"))
+    for rank, (mean, s, per) in enumerate(rows, 1):
+        mark = "  <- committed setting" if s == current else ""
+        if rank <= top or s == current:
+            print("{:>4}  {:>12.4f}  {:>9g} {:>9g} {:>7} {:>8}   {}{}".format(
+                rank, mean, s["team_cost"], s["dead_cost"], s["min_len"],
+                s.get("min_len_dead", s["min_len"]),
+                " ".join("{:.3f}".format(v["spell_f1"]) for v in per.values()), mark))
 
 
 def print_table(result):
     cfg, matches = result["config"], result["matches"]
     d = cfg["decoder"]
     print("\nexam: {} of {} DFL matches, each held out once | LightGBM {} rounds | decoder "
-          "team_cost={} dead_cost={} min_len={} prior_power={}".format(
+          "team_cost={} dead_cost={} min_len={} min_len_dead={} prior_power={}".format(
               len(matches), len(cfg["ids"]), cfg["rounds"], d["team_cost"], d["dead_cost"],
-              d["min_len"], d["prior_power"]))
+              d["min_len"], d.get("min_len_dead", d["min_len"]), d["prior_power"]))
+
+    print("answers: exam {} | training {}".format(_reading(cfg.get("exam_controlled_s")),
+                                                  _reading(cfg.get("train_controlled_s"))))
     print("{:<18}{:>34}   {:>30}".format("", "------------ our model ------------",
                                          "--- official baseline (+/-50) ---"))
     print("{:<18}{:>9}{:>9}{:>9}{:>11}   {:>10}{:>10}{:>10}".format(
@@ -193,6 +342,34 @@ def main(argv=None):
     parser.add_argument("--against", help="compare with a saved result, match by match")
     parser.add_argument("--folds", type=int, help="sit only the first N exams (smoke test)")
     parser.add_argument("--rounds", type=int, help="LightGBM rounds (default: decoder.json)")
+    parser.add_argument("--exam-controlled", type=float, metavar="S",
+                        help="read the exam answers as controlled possession, threshold S seconds")
+    parser.add_argument("--train-controlled", type=float, metavar="S",
+                        help="read the training answers as controlled possession, S seconds")
+    parser.add_argument("--decoder", type=parse_decoder, metavar="T,D,M",
+                        help="sit the exam with team_cost T, dead_cost D, min_len M "
+                             "(default: decoder.json)")
+    parser.add_argument("--grid", action="store_true",
+                        help="score the {} decoder settings of GRID instead of one".format(
+                            len(grid_settings())))
+    parser.add_argument("--lgb", type=parse_assignment, action="append", metavar="KEY=VALUE",
+                        help="override a LightGBM parameter (repeatable), e.g. num_leaves=127")
+    parser.add_argument("--seeds", type=int, default=1,
+                        help="average this many LightGBM models per exam (seeds SEED, SEED+1, ...)")
+    parser.add_argument("--copies", type=int, default=1,
+                        help="corrupted training copies per match (each with its team swap)")
+    parser.add_argument("--extra-features", nargs="?", const=1, default=0, metavar="LEVEL|GROUPS",
+                        type=lambda t: int(t) if t.isdigit() else t,
+                        help="features.build's extra groups: a level (1, 2) or names, e.g. "
+                             "long,sided,close,ballvx")
+    parser.add_argument("--grid-team", type=parse_floats, metavar="T1,T2,...",
+                        help="team_cost values for --grid (default: GRID)")
+    parser.add_argument("--grid-dead", type=parse_floats, metavar="D1,D2,...",
+                        help="dead_cost values for --grid (default: GRID)")
+    parser.add_argument("--grid-min-len-dead", type=parse_ints, metavar="M1,M2,...",
+                        help="dead-ball min_len values (frames) for --grid (default: = min_len)")
+    parser.add_argument("--grid-min-len", type=parse_ints, metavar="M1,M2,...",
+                        help="min_len values (frames) for --grid (default: GRID)")
     parser.add_argument("--dfl-dir", default=DFL_DIR, help="DFL data folder")
     parser.add_argument("--cv-dir", default=CV_DIR, help="where saved results live")
     args = parser.parse_args(argv)
@@ -213,12 +390,29 @@ def main(argv=None):
 
     with open(os.path.join(train.MODEL_DIR, "decoder.json")) as handle:
         cfg = json.load(handle)
+    rounds = args.rounds or cfg["rounds"]
+    knobs = {"lgb_overrides": dict(args.lgb or []), "seeds": args.seeds, "copies": args.copies,
+             "extra_features": args.extra_features}
     t0 = time.time()
-    result = run_exam(args.rounds or cfg["rounds"], cfg["decoder"], args.folds,
-                      dfl_dir=args.dfl_dir)
-    print_table(result)
-    if old is not None:
-        print_against(result, old, args.against)
+    if args.grid:
+        config, exams, probas, priors = out_of_fold(
+            rounds, args.folds, dfl_dir=args.dfl_dir, exam_controlled_s=args.exam_controlled,
+            train_controlled_s=args.train_controlled, **knobs)
+        grid = {"team_cost": tuple(args.grid_team or GRID["team_cost"]),
+                "dead_cost": tuple(args.grid_dead or GRID["dead_cost"]),
+                "min_len": tuple(args.grid_min_len or GRID["min_len"]),
+                "min_len_dead": tuple(args.grid_min_len_dead or ())}
+        rows = evaluate_grid(exams, probas, priors, grid_settings(grid), log=print)
+        print_grid(rows, config, cfg["decoder"])
+        result = {"config": config, "grid": [{"mean_spell_f1": m, "decoder": s, "matches": per}
+                                             for m, s, per in rows]}
+    else:
+        result = run_exam(rounds, args.decoder or cfg["decoder"], args.folds,
+                          dfl_dir=args.dfl_dir, exam_controlled_s=args.exam_controlled,
+                          train_controlled_s=args.train_controlled, **knobs)
+        print_table(result)
+        if old is not None:
+            print_against(result, old, args.against)
     if args.tag:
         os.makedirs(args.cv_dir, exist_ok=True)
         path = os.path.join(args.cv_dir, args.tag + ".json")
