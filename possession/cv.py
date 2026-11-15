@@ -31,7 +31,7 @@ import time
 import lightgbm as lgb
 import numpy as np
 
-from . import atd, augment, dfl, features, train
+from . import atd, augment, dfl, dumps, features, train
 from .common import CACHE_DIR, DFL_DIR, FPS, ROOT, X
 from .labels import controlled
 
@@ -107,14 +107,41 @@ def _frames(seconds):
     return None if seconds is None else int(round(seconds * FPS))
 
 
-def exam_copy(raw, ball_runs, k, exam_frames=None):
-    """Match k's exam: corrupted with a seed of its own, answers read as controlled possession when
-    exam_frames is set. The inputs never depend on exam_frames -- only the labels do."""
+def exam_copy(raw, ball_runs, k, exam_frames=None, dead_gaps=None):
+    """Match k's exam: corrupted with a seed of its own (its ball gaps by dead and live play when
+    dead_gaps is given), answers read as controlled possession when exam_frames is set. The inputs
+    never depend on exam_frames -- only the labels do."""
     exam = augment.corrupt(raw, ball_runs,
-                           np.random.default_rng(train.SEED + EXAM_SEED_OFFSET + k))
+                           np.random.default_rng(train.SEED + EXAM_SEED_OFFSET + k),
+                           dead_gaps=dead_gaps)
     if exam_frames is not None:
         exam["labels"] = controlled(exam["labels"], exam_frames)
     return exam
+
+
+GAP_MODES = ("random", "dead")            # how an exam copy loses its ball
+TRAIN_GAP_MODES = GAP_MODES + ("mixed",)  # mixed: copy 0 random, copy 1 dead, copy 2 random, ...
+
+
+def gap_settings(target, train_gaps="random", exam_gaps="random"):
+    """(the training views' dead_gaps, the exam copies' dead_gaps, a summary for the config). A
+    side with "random" keeps today's random ball gaps (None); "dead" uses augment.dead_gaps(target),
+    measured once from the target's inputs; "mixed" (training only) alternates the two by copy."""
+    if train_gaps not in TRAIN_GAP_MODES:
+        raise ValueError("training ball gaps must be one of {}, not {!r}".format(
+            TRAIN_GAP_MODES, train_gaps))
+    if exam_gaps not in GAP_MODES:
+        raise ValueError("exam ball gaps must be one of {}, not {!r}".format(GAP_MODES, exam_gaps))
+    measured = (augment.dead_gaps(target) if train_gaps != "random" or exam_gaps == "dead"
+                else None)
+    summary = None if measured is None else {
+        "dead_hide": measured.dead_hide, "live_hide": measured.live_hide,
+        "live_gaps": int(len(measured.live_gaps)),
+        "live_gap_median_s": (float(np.median(measured.live_gaps)) / FPS
+                              if len(measured.live_gaps) else None)}
+    train_dg = {"random": None, "dead": measured, "mixed": [None, measured]}[train_gaps]
+    return (train_dg, measured if exam_gaps == "dead" else None,
+            {"train_gaps": train_gaps, "exam_gaps": exam_gaps, "dead_gaps": summary})
 
 
 def _scores(gt, pred):
@@ -203,28 +230,33 @@ def evaluate_grid(exams, probas, priors, settings, log=None):
 
 def out_of_fold(rounds, n_folds=None, log=print, dfl_dir=DFL_DIR,
                 exam_controlled_s=None, train_controlled_s=None,
-                lgb_overrides=None, seeds=1, copies=1, extra_features=False):
+                lgb_overrides=None, seeds=1, copies=1, extra_features=False,
+                train_gaps="random", exam_gaps="random"):
     """Train once per fold. Returns (config, exams, probas, priors) for the exams sat.
 
     exam_controlled_s / train_controlled_s read the exam / training answers as controlled
     possession with that many seconds as the threshold (possession/labels.py); None = raw DFL.
     lgb_overrides change LightGBM parameters; seeds > 1 averages that many models per fold (seed
     SEED + s); copies > 1 adds corrupted training copies; extra_features adds the 25 extra
-    features. The defaults reproduce train.py's model exactly.
+    features; train_gaps / exam_gaps ("random" or "dead", see gap_settings) choose how the
+    training views and the exam copies lose their ball. The defaults reproduce train.py's model
+    exactly.
     """
     params = dict(train.LGB_PARAMS, **(lgb_overrides or {}))
     ids = dfl.match_ids(dfl_dir)
-    ball_runs = augment.ball_run_lengths(atd.load())
+    target = atd.load()
+    ball_runs = augment.ball_run_lengths(target)
+    train_dg, exam_dg, gap_info = gap_settings(target, train_gaps, exam_gaps)
     exam_frames, train_frames = _frames(exam_controlled_s), _frames(train_controlled_s)
     tables, exams, names = {}, {}, None
     for k, i in enumerate(ids):
         raw = dfl.load(i, dfl_dir)
         teach = raw if train_frames is None else dict(
             raw, labels=controlled(raw["labels"], train_frames))
-        Xk, yk, names = _frame_table(training_views(teach, ball_runs, k, copies),
+        Xk, yk, names = _frame_table(training_views(teach, ball_runs, k, copies, train_dg),
                                      train.SUBSAMPLE, extra_features)
         tables[i] = (Xk, yk)
-        exams[i] = exam_copy(raw, ball_runs, k, exam_frames)
+        exams[i] = exam_copy(raw, ball_runs, k, exam_frames, exam_dg)
     log("built training tables and exam copies for {} matches".format(len(ids)))
 
     turns = folds(ids)[:n_folds] if n_folds else folds(ids)
@@ -251,17 +283,20 @@ def out_of_fold(rounds, n_folds=None, log=print, dfl_dir=DFL_DIR,
               "exam_seed_offset": EXAM_SEED_OFFSET, "baseline_window": BASELINE_WINDOW,
               "exam_controlled_s": exam_controlled_s, "train_controlled_s": train_controlled_s,
               "lgb_overrides": dict(lgb_overrides or {}), "seeds": seeds, "copies": copies,
-              "extra_features": extra_features, "n_features": len(names),
+              "extra_features": extra_features, "n_features": len(names), **gap_info,
               "exam_fingerprints": {i: exam_fingerprint(exams[i]) for i in ids}}
     return config, exams, probas, priors
 
 
 def run_exam(rounds, decoder, n_folds=None, log=print, dfl_dir=DFL_DIR,
-             exam_controlled_s=None, train_controlled_s=None, **knobs):
+             exam_controlled_s=None, train_controlled_s=None, dump=None, **knobs):
     """Sit every exam (or the first n_folds). Returns {"config": ..., "matches": {id: scores}}.
-    knobs go to out_of_fold (lgb_overrides, seeds, copies, extra_features)."""
+    knobs go to out_of_fold (lgb_overrides, seeds, copies, extra_features, train_gaps,
+    exam_gaps); dump saves the out-of-fold probabilities as data/cache/diag/<dump>.npz."""
     config, exams, probas, priors = out_of_fold(rounds, n_folds, log, dfl_dir,
                                                 exam_controlled_s, train_controlled_s, **knobs)
+    if dump:
+        log("saved", dumps.save_dump(dump, exams, probas, priors))
     model = score_decoder(exams, probas, priors, decoder)
     matches = {i: {"model": model[i],
                    "baseline": _scores(exams[i]["labels"], baseline_codes(exams[i]))}
@@ -370,6 +405,14 @@ def main(argv=None):
                         help="dead-ball min_len values (frames) for --grid (default: = min_len)")
     parser.add_argument("--grid-min-len", type=parse_ints, metavar="M1,M2,...",
                         help="min_len values (frames) for --grid (default: GRID)")
+    parser.add_argument("--train-gaps", choices=TRAIN_GAP_MODES, default="random",
+                        help="how the training views lose their ball: at random (default), by "
+                             "dead and live play measured from the competition inputs, or mixed "
+                             "(copy 0 random, copy 1 by dead and live play)")
+    parser.add_argument("--exam-gaps", choices=GAP_MODES, default="random",
+                        help="the same for the exam copies")
+    parser.add_argument("--dump", metavar="TAG",
+                        help="save the out-of-fold probabilities as data/cache/diag/<TAG>.npz")
     parser.add_argument("--dfl-dir", default=DFL_DIR, help="DFL data folder")
     parser.add_argument("--cv-dir", default=CV_DIR, help="where saved results live")
     args = parser.parse_args(argv)
@@ -392,7 +435,8 @@ def main(argv=None):
         cfg = json.load(handle)
     rounds = args.rounds or cfg["rounds"]
     knobs = {"lgb_overrides": dict(args.lgb or []), "seeds": args.seeds, "copies": args.copies,
-             "extra_features": args.extra_features}
+             "extra_features": args.extra_features, "train_gaps": args.train_gaps,
+             "exam_gaps": args.exam_gaps}
     t0 = time.time()
     if args.grid:
         config, exams, probas, priors = out_of_fold(
@@ -402,6 +446,8 @@ def main(argv=None):
                 "dead_cost": tuple(args.grid_dead or GRID["dead_cost"]),
                 "min_len": tuple(args.grid_min_len or GRID["min_len"]),
                 "min_len_dead": tuple(args.grid_min_len_dead or ())}
+        if args.dump:
+            print("saved", dumps.save_dump(args.dump, exams, probas, priors))
         rows = evaluate_grid(exams, probas, priors, grid_settings(grid), log=print)
         print_grid(rows, config, cfg["decoder"])
         result = {"config": config, "grid": [{"mean_spell_f1": m, "decoder": s, "matches": per}
@@ -409,7 +455,7 @@ def main(argv=None):
     else:
         result = run_exam(rounds, args.decoder or cfg["decoder"], args.folds,
                           dfl_dir=args.dfl_dir, exam_controlled_s=args.exam_controlled,
-                          train_controlled_s=args.train_controlled, **knobs)
+                          train_controlled_s=args.train_controlled, dump=args.dump, **knobs)
         print_table(result)
         if old is not None:
             print_against(result, old, args.against)

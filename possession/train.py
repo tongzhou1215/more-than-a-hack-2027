@@ -65,20 +65,25 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
-def corrupted_pair(match, ball_runs, seed):
-    """One DFL match made to look like the competition ATD, and its home/away-swapped twin."""
-    noisy = augment.corrupt(match, ball_runs, np.random.default_rng(seed))
+def corrupted_pair(match, ball_runs, seed, dead_gaps=None):
+    """One DFL match made to look like the competition ATD, and its home/away-swapped twin.
+    dead_gaps (augment.DeadGaps) places the ball gaps by the match's dead and live play."""
+    noisy = augment.corrupt(match, ball_runs, np.random.default_rng(seed), dead_gaps=dead_gaps)
     return [noisy, augment.swap_teams(noisy)]
 
 
 copies = corrupted_pair  # the name earlier versions of this module used
 
 
-def training_views(teach, ball_runs, k, copies=1):
-    """Match k's training views: `copies` corrupted pairs, pair c seeded SEED + k + 1000 * c."""
+def training_views(teach, ball_runs, k, copies=1, dead_gaps=None):
+    """Match k's training views: `copies` corrupted pairs, pair c seeded SEED + k + 1000 * c.
+    dead_gaps is one augment.DeadGaps for every copy, or a list whose entry c % len goes to copy c
+    (None = random gaps): [None, gaps] keeps copy 0 random and has copy 1 follow dead and live
+    play."""
     views = []
     for c in range(copies):
-        views += corrupted_pair(teach, ball_runs, SEED + k + COPY_SEED_STRIDE * c)
+        dg = dead_gaps[c % len(dead_gaps)] if isinstance(dead_gaps, list) else dead_gaps
+        views += corrupted_pair(teach, ball_runs, SEED + k + COPY_SEED_STRIDE * c, dg)
     return views
 
 

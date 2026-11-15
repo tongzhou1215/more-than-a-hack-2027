@@ -10,9 +10,9 @@ on the other matches' training views: the same corrupted copies and team swaps L
 on, with raw DFL answers. Each fold is trained by seq.fit, the recipe train.py uses for the final
 model, so its feature scaler is fitted on that fold's training views only.
 
-Out-of-fold probabilities are saved as data/cache/diag/<tag>.npz, in the format of the
-scratchpad's oof_dump.py, so two runs can be compared, blended and diagnosed. --against and --blend
-read such dumps (v3 = LightGBM v3, made by oof_dump.py). Only aggregate scores are printed.
+Out-of-fold probabilities are saved as data/cache/diag/<tag>.npz (possession/dumps.py, the
+format cv.py --dump writes for LightGBM), so two runs can be compared, blended and diagnosed.
+--against and --blend read such dumps. Only aggregate scores are printed.
 
 No competition label is read; as in cv.py, only the shape of its ball-gap runs.
 """
@@ -26,52 +26,12 @@ import numpy as np
 import torch
 
 from . import atd, augment, cv, dfl, features, seq, train
-from .common import CACHE_DIR, DFL_DIR, X
+from .common import DFL_DIR, X
+from .dumps import DIAG_DIR, KEYS, blend, check_same_exams, load_dump, save_dump  # noqa: F401
 
-DIAG_DIR = os.path.join(CACHE_DIR, "diag")  # data/ is gitignored
 EXAM_CONTROLLED_S = 2.0
 WEIGHTS = (0.25, 0.5, 0.75)
 BLEND_GRID = {"team_cost": (1.0, 2.0, 4.0), "dead_cost": (32.0, 64.0), "min_len": (50, 75, 100)}
-KEYS = ("proba", "labels", "seen", "halves", "prior")
-
-
-def save_dump(tag, exams, probas, priors, folder=DIAG_DIR):
-    """Out-of-fold probabilities and what the exams were made of, as <folder>/<tag>.npz."""
-    os.makedirs(folder, exist_ok=True)
-    out = {}
-    for i in probas:
-        out[i + "__proba"] = np.asarray(probas[i], dtype=np.float32)
-        out[i + "__labels"] = exams[i]["labels"]
-        out[i + "__seen"] = ~np.isnan(exams[i]["ball"][:, 0])
-        out[i + "__halves"] = np.array(exams[i]["halves"])
-        out[i + "__prior"] = np.asarray(priors[i])
-    path = os.path.join(folder, tag + ".npz")
-    np.savez_compressed(path, ids=np.array(list(probas)), **out)
-    return path
-
-
-def load_dump(tag, folder=DIAG_DIR):
-    """{match id: {"proba", "labels", "seen", "halves", "prior"}} from save_dump / oof_dump.py."""
-    z = np.load(os.path.join(folder, tag + ".npz"))
-    return {str(i): {k: z[str(i) + "__" + k] for k in KEYS} for i in z["ids"]}
-
-
-def check_same_exams(a, b):
-    """ValueError unless the two dumps sat the same exams: the same matches, answers, halves and
-    ball mask (the answers alone do not show how the exam copy was corrupted)."""
-    if set(a) != set(b):
-        raise ValueError("different matches: {} vs {}".format(sorted(a), sorted(b)))
-    for i in a:
-        for k in ("labels", "halves", "seen"):
-            if not np.array_equal(a[i][k], b[i][k]):
-                raise ValueError("{}: the two runs sat different exam copies ({})".format(i, k))
-
-
-def blend(a, b, w):
-    """A dump whose probabilities are w * a + (1 - w) * b, after checking both sat the same exams."""
-    check_same_exams(a, b)
-    return {i: dict(a[i], proba=w * a[i]["proba"].astype(np.float64)
-                    + (1.0 - w) * b[i]["proba"].astype(np.float64)) for i in a}
 
 
 def score_dump(dump, decoder):
@@ -82,20 +42,23 @@ def score_dump(dump, decoder):
 
 
 def out_of_fold_gru(extra, epochs, hidden, device, n_folds=None, log=print, dfl_dir=DFL_DIR,
-                    seeds=1):
+                    seeds=1, train_gaps="random", exam_gaps="random"):
     """Train the GRU once per fold, or `seeds` GRUs whose probabilities are averaged (member
     seeds seq.member_seeds(SEED + exam index, seeds), so member 0 is the one-GRU exam's model).
-    Returns (config, exams, probas, priors) like cv.out_of_fold."""
+    train_gaps / exam_gaps choose how the training views and exam copies lose their ball
+    (cv.gap_settings). Returns (config, exams, probas, priors) like cv.out_of_fold."""
     ids = dfl.match_ids(dfl_dir)
-    ball_runs = augment.ball_run_lengths(atd.load())
+    target = atd.load()
+    ball_runs = augment.ball_run_lengths(target)
+    train_dg, exam_dg, gap_info = cv.gap_settings(target, train_gaps, exam_gaps)
     views, exams, exam_x, n_features = {}, {}, {}, None
     for k, i in enumerate(ids):
         raw = dfl.load(i, dfl_dir)
         views[i] = []
-        for v in cv.training_views(raw, ball_runs, k, train.COPIES):
+        for v in cv.training_views(raw, ball_runs, k, train.COPIES, train_dg):
             f, names, mask = features.build(v, extra=extra)
             views[i].append((f, v["labels"], v["halves"], mask & (v["labels"] != X)))
-        exams[i] = cv.exam_copy(raw, ball_runs, k, cv._frames(EXAM_CONTROLLED_S))
+        exams[i] = cv.exam_copy(raw, ball_runs, k, cv._frames(EXAM_CONTROLLED_S), exam_dg)
         exam_x[i] = features.build(exams[i], extra=extra)[0]
         n_features = len(names)
     log("built training views and exam copies for {} matches, {} features".format(
@@ -124,7 +87,7 @@ def out_of_fold_gru(extra, epochs, hidden, device, n_folds=None, log=print, dfl_
               "copies": train.COPIES, "extra_features": extra, "n_features": n_features,
               "exam_seed_offset": cv.EXAM_SEED_OFFSET, "exam_controlled_s": EXAM_CONTROLLED_S,
               "train_controlled_s": None, "device": str(device), "torch": torch.__version__,
-              "exam_fingerprints": {i: cv.exam_fingerprint(exams[i]) for i in ids}}
+              "exam_fingerprints": {i: cv.exam_fingerprint(exams[i]) for i in ids}, **gap_info}
     return config, exams, probas, priors
 
 
@@ -187,6 +150,10 @@ def main(argv=None):
     p.add_argument("--hidden", type=int, default=seq.HIDDEN)
     p.add_argument("--seeds", type=int, default=1,
                    help="GRUs per fold, trained from different seeds, probabilities averaged")
+    p.add_argument("--train-gaps", choices=cv.TRAIN_GAP_MODES, default="random",
+                   help="how the training views lose their ball (see cv.py)")
+    p.add_argument("--exam-gaps", choices=cv.GAP_MODES, default="random",
+                   help="how the exam copies lose their ball (see cv.py)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--folds", type=int, help="sit only the first N exams (smoke test)")
     p.add_argument("--blend", nargs=2, metavar=("REF", "NEW"),
@@ -203,7 +170,9 @@ def main(argv=None):
             p.error("--tag is needed to save the exam run")
         extra = int(a.extra) if a.extra.isdigit() else a.extra
         config, exams, probas, priors = out_of_fold_gru(extra, a.epochs, a.hidden, a.device,
-                                                        a.folds, seeds=a.seeds)
+                                                        a.folds, seeds=a.seeds,
+                                                        train_gaps=a.train_gaps,
+                                                        exam_gaps=a.exam_gaps)
         save_dump(a.tag, exams, probas, priors)
         mine = load_dump(a.tag)
         scores = score_dump(mine, train.DECODER)

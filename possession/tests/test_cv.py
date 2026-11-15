@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from possession import cv
+from possession import augment, cv
 from possession.common import X
 
 H, A, D = 0, 1, 2
@@ -117,6 +117,47 @@ def test_training_views_copy_zero_is_the_original_and_more_copies_differ():
     assert np.array_equal(two[0]["ball"], one[0]["ball"], equal_nan=True)
     assert np.array_equal(two[1]["labels"], one[1]["labels"])
     assert not np.array_equal(two[2]["ball"], two[0]["ball"], equal_nan=True)
+
+
+def test_gap_settings_keep_random_gaps_without_measuring():
+    train_dg, exam_dg, info = cv.gap_settings(None, "random", "random")  # no target needed
+    assert (train_dg, exam_dg) == (None, None) and info["dead_gaps"] is None
+    with pytest.raises(ValueError):
+        cv.gap_settings(None, "random", "sometimes")
+
+
+def test_mixed_training_views_alternate_the_gaps_by_copy():
+    m = _match([1.0] * 600, labels=[H] * 200 + [D] * 200 + [A] * 200)
+    ball_runs = (np.array([40]), np.array([20]))
+    gaps = augment.DeadGaps(1.0, 0.0, np.array([20]))
+    mixed = cv.training_views(m, ball_runs, 0, copies=2, dead_gaps=[None, gaps])
+    plain = cv.training_views(m, ball_runs, 0, copies=1)
+    assert len(mixed) == 4
+    assert np.array_equal(mixed[0]["ball"], plain[0]["ball"], equal_nan=True)  # copy 0: random
+    seen = ~np.isnan(mixed[2]["ball"][:, 0])  # copy 1 follows dead and live play
+    assert seen[:200].all() and seen[400:].all()
+    assert not seen[200:400 - augment.REAPPEAR_MAX].any()
+
+
+def test_gap_settings_mixed_trains_both_ways_and_exams_refuse_it(monkeypatch):
+    measured = augment.DeadGaps(0.9, 0.1, np.array([100, 200]))
+    monkeypatch.setattr(augment, "dead_gaps", lambda target: measured)
+    train_dg, exam_dg, info = cv.gap_settings(None, "mixed", "dead")
+    assert train_dg[0] is None and train_dg[1] is measured and exam_dg is measured
+    assert info["train_gaps"] == "mixed" and info["dead_gaps"]["live_gap_median_s"] == 6.0
+    with pytest.raises(ValueError):
+        cv.gap_settings(None, "random", "mixed")
+
+
+def test_exam_copy_and_training_views_pass_dead_gaps_on():
+    m = _match([1.0] * 600, labels=[H] * 200 + [D] * 200 + [A] * 200)
+    ball_runs = (np.array([40]), np.array([20]))  # random gaps would hide live frames too
+    gaps = augment.DeadGaps(1.0, 0.0, np.array([20]))
+    views = cv.training_views(m, ball_runs, 0, copies=1, dead_gaps=gaps)
+    for v in [cv.exam_copy(m, ball_runs, 0, dead_gaps=gaps)] + views:
+        seen = ~np.isnan(v["ball"][:, 0])
+        assert seen[:200].all() and seen[400:].all()
+        assert not seen[200:400 - augment.REAPPEAR_MAX].any()
 
 
 def test_parse_decoder_reads_an_optional_dead_ball_minimum():
