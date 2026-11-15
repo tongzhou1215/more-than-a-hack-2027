@@ -1,3 +1,9 @@
+> **Team Mendota Metrics.** This is the organisers' starter repository with our entry added in
+> [`possession/`](possession/). To install it and regenerate our submission file, see
+> [`possession/README.md`](possession/README.md). The method, training data and limitations are in
+> [`docs/technical_document.md`](docs/technical_document.md). Everything below this box is the
+> organisers' original README.
+
 # More than a Hack 2027 — Phase 1: Ball Possession
 
 **Organised by [Metrica Sports](https://metrica-sports.com), [FC Barcelona](https://www.fcbarcelona.com)

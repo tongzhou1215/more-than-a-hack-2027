@@ -12,6 +12,8 @@
 
 本节是现在的提交版本。后面的 0.1 节（v3）和第 1–8 节是之前的记录；模型、参数和复现步骤以本节为准。
 
+英文的技术文档在 [`docs/technical_document.md`](docs/technical_document.md)，英文的安装和运行说明在 [`possession/README.md`](possession/README.md)。
+
 ### 现在提交用的是什么
 - **两个模型合用**：每一帧的 H/A/D 概率 = **0.35 × LightGBM + 0.65 × GRU**，权重写在 `possession/model/decoder.json` 的 `lgbm_weight`。
   - **LightGBM**：配置和 v3 相同（109 个特征，2 份弄脏副本加主客互换，126 轮），用修好方向的特征重新训练。
@@ -56,9 +58,9 @@ python -m possession.predict
 ```bash
 python -m possession.seq_cv --tag g3 --epochs 6
 ```
-GRU 的考场，在 GPU 上约 5 分钟，平均 0.7012；重跑一次，7 场的概率逐个相同。LightGBM 的考场还是 `python -m possession.cv --exam-controlled 2 --decoder 2,64,75 --extra-features 1 --copies 2`（平均 0.6592）。合用的分数用 `python -m possession.seq_cv --blend v3o g3` 算，但其中 LightGBM 的考场概率文件 `v3o` 目前是用一个临时脚本生成的，还没放进仓库。
+GRU 的考场，在 GPU 上约 5 分钟，平均 0.7012；重跑一次，7 场的概率逐个相同。LightGBM 的考场还是 `python -m possession.cv --exam-controlled 2 --decoder 2,64,75 --extra-features 1 --copies 2`（平均 0.6592）。合用的分数用 `python -m possession.seq_cv --blend v3o g3` 算。其中 LightGBM 的考场概率文件 `v3o`，在上面那条 `cv.py` 命令后面加 `--dump v3o` 就能生成；2026-11-15 核对过，这样生成的 7 场概率和原来用临时脚本生成的逐个相同。
 
-测试用 `python -m pytest possession/tests`，81 个，需要另装 pytest；没装 PyTorch 时 GRU 相关的 4 个会跳过。
+测试用 `python -m pytest possession/tests`，99 个，需要另装 pytest；没装 PyTorch 时，需要它的测试会自动跳过（剩下的 74 个通过）。
 
 ### 训练数据和巴萨这场差多少（`python -m possession.gap`，只用输入，不看答案）
 - 训练一个小模型分辨"弄脏的德甲"和"巴萨这场"的帧：AUC **0.991**，几乎每一帧都能分出来（0.5 才是分不出）。作为参照，一场德甲对另外六场只有 0.59（0.52–0.74），所以这不是"比赛风格不同"能解释的。
@@ -86,10 +88,12 @@ GRU 的考场，在 GPU 上约 5 分钟，平均 0.7012；重跑一次，7 场�
 两种做法在新考卷上都过了门槛，但在旧考卷上掉得比事先定的 0.01 多，所以按规则都不采用。原因是：学会"球不见了多半是死球"的模型，遇到活球里大量随机丢球（旧考卷活球时四成多看不到球，巴萨这场最快那一成只有一成）就会误判成死球。另外，新考卷上连 v4 也有 0.741，说明旧考卷比真实情况难，之前的分数估计偏保守。
 
 ### 提交前还要做
-- [ ] 提交（commit）并推送 v4 的代码和模型文件。
-- [ ] 检查仓库里没有比赛数据，再把仓库改成公开。
-- [ ] 写技术文档。
-- [ ] 把 CSV 和文档按队名命名（`<team_name>.csv`、`<team_name>.pdf`），在截止前用报名邮件里的表单提交。
+- [x] 技术文档：[`docs/technical_document.md`](docs/technical_document.md)；安装和运行说明：[`possession/README.md`](possession/README.md)。
+- [x] 最终核对（2026-11-15）：训练两次、预测两次，4 个模型文件和 CSV 都和仓库里的逐字节相同，官方格式检查通过。
+- [x] 仓库里没有比赛数据：git 里 `data/` 下只有主办方的 `README.md`。
+- [x] 提交（commit）并推送到 GitHub。
+- [ ] 把 GitHub 仓库改成公开。
+- [ ] 把 CSV 和文档按队名命名（`<team_name>.csv`、`<team_name>.pdf` 或 `.md`），在截止前用报名邮件里的表单提交。
 
 ---
 

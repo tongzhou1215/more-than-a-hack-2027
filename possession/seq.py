@@ -15,7 +15,7 @@ parameters as one flat float32 array and a JSON file with everything else, so th
 gives the same bytes. Prediction runs in the model's dtype: predict.py upcasts the float32 weights
 to float64, where last-bit differences between machines cannot change a decision.
 
-Needs PyTorch (C:\\csProjects\\venv-nn holds torch 2.7.1+cu128). Seeded and deterministic.
+Needs PyTorch (possession/requirements.txt pins 2.7.1). Seeded and deterministic.
 """
 
 import json
