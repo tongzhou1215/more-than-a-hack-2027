@@ -18,7 +18,7 @@ tactical ATD ─► 109 features ─┬─► LightGBM ─┐
 
 - **Training data:** the 7 public matches of the Sportec Open DFL dataset, corrupted to resemble the provided tracking. No label of the provided game was used to train, tune or select anything.
 - **Estimated quality:** mean spellF1 0.712 on a leave-one-match-out exam over the 7 DFL matches, where the official baseline scores 0.195.
-- **Public 5-minute window,** checked once, on the final file: spellF1 0.690, macroF1 0.908.
+- **Public 5-minute window:** repeated pipeline checks of the frozen final file give spellF1 0.690 and macroF1 0.908. These checks were not used for training, tuning or version selection.
 - **Reproduction:** the repository regenerates the submitted file byte for byte.
 
 ## 1. Approach
@@ -63,7 +63,7 @@ The blend beats LightGBM on all 7 matches and the GRU on 6 of 7. Its mean macroF
 | Tactical ATD (`BAR-ATH_tactical_atd.txt`, `_atd.xml`) | yes | The only model input: positions of every player slot and of the ball, and each slot's team. Speed is recomputed from positions, so that the same code runs on DFL. |
 | Smart Tagging (`BAR-ATH_tactical_smart_tagging.xml`) | one rule | The "Kick Off (Start)" tag of each half drives the kickoff rule (section 4); also the sanity check below. Not used for training or tuning. |
 | `games.py` constants | yes | Graded half boundaries, pitch size, frame alignment. |
-| Public 5-minute ground truth | pipeline check | The final file was scored on it once. Never used to train, tune or choose between versions. |
+| Public 5-minute ground truth | pipeline check | Used for repeated pipeline checks of the frozen final file. Never used to train, tune or choose between versions. |
 | Tactical video and homography | no | Only needed for ball detection, which we did not attempt. |
 | Broadcast video, ATD and homography | no | A different timeline, with no mapping to the tactical video. |
 
